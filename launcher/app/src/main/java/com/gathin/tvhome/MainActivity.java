@@ -355,6 +355,11 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             // Updates send REMOVED followed by ADDED; keep the tile until the new APK is ready.
             if (Intent.ACTION_PACKAGE_REMOVED.equals(intent.getAction())
                     && intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) return;
+            if (intent.getData() != null) {
+                AppDiscovery.invalidatePackage(intent.getData().getSchemeSpecificPart());
+            } else {
+                AppDiscovery.invalidateCache();
+            }
             // In the background this only marks the tiles stale; onResume rebuilds them once.
             if (!tileRefresh.onPackagesChanged()) return;
             reloadApps(false);
@@ -579,6 +584,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         });
         grid.setHasFixedSize(true);
         grid.setItemAnimator(null);
+        grid.setItemViewCacheSize(20);
         // Tiles that scroll out while one is carried come back from the view cache without a rebind; set their
         // dimming again whenever one attaches, so none stays dim after the drop.
         grid.addOnChildAttachStateChangeListener(new RecyclerView.OnChildAttachStateChangeListener() {
@@ -920,9 +926,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (stopped) {
             tileRefresh.onHomeAgain();
         } else {
-            // Still on screen (the quick panel was over it, or Home was already in front): the tiles are current,
-            // so only go back to the first one; rebuilding would replay the entrance animation for nothing.
-            grid.post(() -> focusTile(0));
+            // Still on screen: pressing Home while on Home refreshes app list cache
+            AppDiscovery.invalidateCache();
+            reloadApps(false);
         }
     }
 
@@ -1088,7 +1094,18 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
     /** True when PackageManager reports apps changed since the last rebuild (one binder call). */
     private boolean packagesChangedSinceRebuild() {
         ChangedPackages changed = getPackageManager().getChangedPackages(packageSequence);
-        return changed != null && !changed.getPackageNames().isEmpty();
+        if (changed != null && !changed.getPackageNames().isEmpty()) return true;
+        int lastCount = AppDiscovery.getLastDiscoveredPackageCount();
+        if (lastCount > 0) {
+            try {
+                int currentCount = getPackageManager().getInstalledApplications(0).size();
+                if (currentCount != lastCount) {
+                    AppDiscovery.invalidateCache();
+                    return true;
+                }
+            } catch (Exception ignored) {}
+        }
+        return false;
     }
 
     private int currentPackageSequence(int since) {
@@ -1110,12 +1127,19 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         // An updated app may bring new artwork; the backdrop is cheap to make again.
         heroArtCache.clear();
         heroArtKey = null;
-        // One LEANBACK query for both the tiles and the card checks.
-        final List<ResolveInfo> leanback = getPackageManager().queryIntentActivities(
-                new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER), 0);
+
+        AppDiscovery.Result discovery = AppDiscovery.discover(this);
+        // LEANBACK query for card checks
+        final List<ResolveInfo> leanback = new ArrayList<>();
+        for (ResolveInfo ri : discovery.allLaunchable) {
+            if (ri.activityInfo != null && discovery.leanbackPackages.contains(ri.activityInfo.packageName)) {
+                leanback.add(ri);
+            }
+        }
         cards = moduleCards ? CardFeature.run(() -> Cards.discover(this, hiddenApps,
                 () -> Cards.load(Cards.storeFile(this)), leanback), none) : none;
-        adapter.reload(cards.isEmpty() ? none : CardFeature.run(() -> Cards.shown(cards), none), leanback);
+        adapter.reload(cards.isEmpty() ? none : CardFeature.run(() -> Cards.shown(cards), none),
+                discovery.allLaunchable, discovery.leanbackPackages);
         lastFocusedKey = returnKey;
         lastFocused = returnSlot;
         packageSequence = currentPackageSequence(packageSequence);
@@ -2466,6 +2490,16 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         };
         grid.addOnScrollListener(pendingFocusScroll);
         grid.smoothScrollToPosition(pos);
+        // Safety timeout in case smoothScrollToPosition never produces SCROLL_STATE_IDLE
+        grid.postDelayed(() -> {
+            if (pendingFocusScroll != null) {
+                grid.removeOnScrollListener(pendingFocusScroll);
+                pendingFocusScroll = null;
+                RecyclerView.ViewHolder h = grid.findViewHolderForAdapterPosition(pos);
+                View target = h != null ? h.itemView.findViewById(R.id.card) : grid.getChildAt(0);
+                if (target != null && !target.hasFocus()) target.requestFocus();
+            }
+        }, 350);
     }
 
     // ---- top bar ---------------------------------------------------------------------------------

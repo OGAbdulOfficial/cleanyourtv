@@ -256,13 +256,25 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
      * so focus follows it); hidden_apps wins over a card, and a card's package in dock_apps takes that slot.
      */
     void reload(List<Cards.Card> cards, List<ResolveInfo> leanback) {
+        Set<String> leanbackPkgs = new HashSet<>();
+        for (ResolveInfo ri : leanback) {
+            if (ri.activityInfo != null && ri.activityInfo.packageName != null) {
+                leanbackPkgs.add(ri.activityInfo.packageName);
+            }
+        }
+        reload(cards, leanback, leanbackPkgs);
+    }
+
+    void reload(List<Cards.Card> cards, List<ResolveInfo> allLaunchable, Set<String> leanbackPkgs) {
         PackageManager pm = ctx.getPackageManager();
-        // The LEANBACK query is shared with the module-card check (MainActivity); copy it before adding
-        // library apps so the caller's list stays as it was.
-        List<ResolveInfo> found = new ArrayList<>(leanback);
+        List<ResolveInfo> found = new ArrayList<>(allLaunchable);
         Set<String> tvPackages = new HashSet<>();
-        for (ResolveInfo ri : found) if (ri.activityInfo != null) tvPackages.add(ri.activityInfo.packageName);
-        leanbackPackages = tvPackages;
+        for (ResolveInfo ri : found) {
+            if (ri.activityInfo != null && ri.activityInfo.packageName != null) {
+                tvPackages.add(ri.activityInfo.packageName);
+            }
+        }
+        leanbackPackages = new HashSet<>(leanbackPkgs);
         // Copy before merging: LibraryApps.load() may return an immutable empty set (#419).
         Set<String> added = new HashSet<>(LibraryApps.load(ctx));
         added.addAll(libraryPreload);
@@ -272,7 +284,10 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             for (ResolveInfo ri : pm.queryIntentActivities(
                     new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)) {
                 if (ri.activityInfo != null && added.contains(ri.activityInfo.packageName)
-                        && seen.add(ri.activityInfo.packageName)) found.add(ri);
+                        && seen.add(ri.activityInfo.packageName)) {
+                    found.add(ri);
+                    tvPackages.add(ri.activityInfo.packageName);
+                }
             }
         }
         Map<String, Cards.Card> cardByPkg = new HashMap<>();
@@ -294,19 +309,39 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             String label = card != null ? card.label : Cards.cleanLabel(
                     appLabels.containsKey(pkg) ? appLabels.get(pkg) : String.valueOf(ri.loadLabel(pm)), pkg);
             if (!seen.add(pkg + '\n' + label)) continue;
+            
+            AppDiscovery.AppCache cached = AppDiscovery.getCached(pkg);
             Drawable banner = null;
-            // uniform_tiles draws the icon, so an app's banner is never loaded. A module card keeps its banner.
-            if (!(uniformTiles && card == null)) {
-                banner = bundledBanner(appBanners.get(pkg));
-                if (banner == null) banner = iconTiles.contains(pkg) ? iconBanner(ri.loadIcon(pm)) : loadBanner(pm, ri);
-            }
-            // The icon is only drawn (and sampled for the glow) when there is no banner, so a tile with a
-            // banner skips loading and decoding it.
-            Drawable icon = banner == null ? ri.loadIcon(pm) : null;
-            if (card != null) {
-                fresh.add(new Entry(Entry.CARD, label, component, banner, icon, card.caption, card.accent));
+            Drawable icon = null;
+            int ambient = 0;
+            if (cached != null) {
+                banner = cached.banner;
+                icon = cached.icon;
+                ambient = cached.ambientColor;
             } else {
-                fresh.add(new Entry(label, component, banner, icon));
+                if (!(uniformTiles && card == null)) {
+                    banner = bundledBanner(appBanners.get(pkg));
+                    if (banner == null) banner = iconTiles.contains(pkg) ? iconBanner(safeLoadIcon(pm, ri)) : loadBanner(pm, ri);
+                }
+                icon = banner == null ? safeLoadIcon(pm, ri) : null;
+                if (card != null && card.accent != 0) {
+                    ambient = card.accent;
+                } else if (uniformTiles && banner == null) {
+                    ambient = dominantColor(icon);
+                } else {
+                    ambient = vividColor(banner != null ? banner : icon);
+                }
+                long updated = 0;
+                try {
+                    updated = pm.getPackageInfo(pkg, 0).lastUpdateTime;
+                } catch (Exception ignored) {}
+                AppDiscovery.putCache(pkg, new AppDiscovery.AppCache(updated, label, banner, icon, ambient));
+            }
+
+            if (card != null) {
+                fresh.add(new Entry(Entry.CARD, label, component, banner, icon, card.caption, card.accent != 0 ? card.accent : ambient));
+            } else {
+                fresh.add(new Entry(Entry.APP, label, component, banner, icon, null, ambient));
             }
         }
         Collections.sort(fresh, (a, b) -> {
@@ -341,6 +376,18 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         items.clear();
         items.addAll(fresh);
         notifyDataSetChanged();
+    }
+
+    private Drawable safeLoadIcon(PackageManager pm, ResolveInfo ri) {
+        try {
+            Drawable icon = ri.loadIcon(pm);
+            if (icon != null) return icon;
+        } catch (Exception ignored) {}
+        try {
+            return pm.getDefaultActivityIcon();
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     /** icon_tiles: the app's icon centred on a dark banner-shaped tile, for apps whose own banner crops badly. */
@@ -532,8 +579,12 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
                 .setComponent(e.component)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
         // TV apps launch with the same leanback intent as from the stock launcher or the remote, so an app
-        // already running resumes instead of restarting; only phone apps added from the library use plain MAIN.
-        if (leanbackPackages.contains(e.pkg)) i.addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
+        // already running resumes instead of restarting; other apps use CATEGORY_LAUNCHER.
+        if (leanbackPackages.contains(e.pkg)) {
+            i.addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
+        } else {
+            i.addCategory(Intent.CATEGORY_LAUNCHER);
+        }
         String action = launchActions.get(e.pkg);
         if (action != null) {
             // NEW_TASK only: with RESET_TASK_IF_NEEDED, Android just brings a running task of the app to the front
@@ -548,6 +599,18 @@ public class AppAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
                 ((Activity) ctx).overridePendingTransition(R.anim.app_open_enter, R.anim.app_open_exit);
             }
         } catch (Exception ex) {
+            // Fallback for OEM / unusual apps: query launch intent directly
+            try {
+                PackageManager pm = ctx.getPackageManager();
+                Intent fallback = pm.getLeanbackLaunchIntentForPackage(e.pkg);
+                if (fallback == null) fallback = pm.getLaunchIntentForPackage(e.pkg);
+                if (fallback != null) {
+                    fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    ctx.startActivity(fallback);
+                    if (cinematic) LastOpened.record(ctx, e.pkg);
+                    return;
+                }
+            } catch (Exception ignored) {}
             Toast.makeText(ctx, ctx.getString(R.string.cant_open, e.label), Toast.LENGTH_SHORT).show();
         }
     }

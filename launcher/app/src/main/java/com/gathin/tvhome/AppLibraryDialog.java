@@ -221,17 +221,17 @@ final class AppLibraryDialog {
         PackageManager pm = activity.getPackageManager();
         String self = activity.getPackageName();
         LOADER.execute(() -> {
+            AppDiscovery.Result result = AppDiscovery.discover(activity);
             Map<String, ResolveInfo> unique = new LinkedHashMap<>();
-            Set<String> tv = new HashSet<>();
-            // Prefer the TV entry when an app declares both categories.
-            for (String category : new String[]{Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER}) {
-                for (ResolveInfo info : pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN).addCategory(category), 0)) {
-                    if (info.activityInfo == null || !info.activityInfo.exported) continue;
-                    String pkg = info.activityInfo.packageName;
-                    if (Intent.CATEGORY_LEANBACK_LAUNCHER.equals(category)) tv.add(pkg);
-                    if (!pkg.equals(self) && !unique.containsKey(pkg)) unique.put(pkg, info);
+            for (ResolveInfo ri : result.allLaunchable) {
+                if (ri.activityInfo != null && ri.activityInfo.packageName != null) {
+                    String pkg = ri.activityInfo.packageName;
+                    if (!unique.containsKey(pkg)) {
+                        unique.put(pkg, ri);
+                    }
                 }
             }
+            Set<String> tv = result.leanbackPackages;
             Map<String, String> names = new HashMap<>();
             Map<String, Long> installed = new HashMap<>();
             for (Map.Entry<String, ResolveInfo> entry : unique.entrySet()) {
@@ -309,6 +309,13 @@ final class AppLibraryDialog {
         String pkg = app.activityInfo.packageName;
         icon.setTag(pkg);
         Drawable cached = icons.get(pkg);
+        if (cached == null) {
+            AppDiscovery.AppCache ac = AppDiscovery.getCached(pkg);
+            if (ac != null && ac.icon != null) {
+                cached = ac.icon;
+                icons.put(pkg, cached);
+            }
+        }
         icon.setImageDrawable(cached);
         if (cached != null || !iconsLoading.add(pkg)) return;
         PackageManager pm = activity.getPackageManager();
@@ -316,6 +323,10 @@ final class AppLibraryDialog {
             Drawable loaded;
             try { loaded = app.loadIcon(pm); }
             catch (RuntimeException unavailable) { loaded = null; }
+            if (loaded == null) {
+                try { loaded = pm.getDefaultActivityIcon(); }
+                catch (RuntimeException ignored) {}
+            }
             Drawable result = loaded;
             main.post(() -> {
                 iconsLoading.remove(pkg);
@@ -498,10 +509,25 @@ final class AppLibraryDialog {
         Intent intent = new Intent(Intent.ACTION_MAIN).setComponent(
                 new ComponentName(app.activityInfo.packageName, app.activityInfo.name));
         // TV apps keep the leanback launch intent, so an app already running resumes instead of restarting.
-        if (tvPackages.contains(app.activityInfo.packageName)) intent.addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
+        if (tvPackages.contains(app.activityInfo.packageName)) {
+            intent.addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
+        } else {
+            intent.addCategory(Intent.CATEGORY_LAUNCHER);
+        }
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-        try { activity.startActivity(intent); }
-        catch (ActivityNotFoundException | SecurityException e) {
+        try {
+            activity.startActivity(intent);
+        } catch (ActivityNotFoundException | SecurityException e) {
+            PackageManager pm = activity.getPackageManager();
+            Intent fallback = pm.getLeanbackLaunchIntentForPackage(app.activityInfo.packageName);
+            if (fallback == null) fallback = pm.getLaunchIntentForPackage(app.activityInfo.packageName);
+            if (fallback != null) {
+                fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                try {
+                    activity.startActivity(fallback);
+                    return;
+                } catch (ActivityNotFoundException | SecurityException ignored) {}
+            }
             Toast.makeText(activity, activity.getString(R.string.cant_open, label(app)), Toast.LENGTH_SHORT).show();
         }
     }
