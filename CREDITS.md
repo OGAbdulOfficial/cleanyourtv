@@ -15,7 +15,7 @@
 - **Channel Network**: [@NAGIxAbdulBotZOfficial](https://t.me/NAGIxAbdulBotZOfficial) / [@AbdulDevProofs](https://t.me/AbdulDevProofs)
 
 ### Contributions in this Release:
-- Built and signed ready-to-install Android TV release APK (`CleanYourTV-Launcher-v3.1-community.1-release.apk`).
+- Built and signed ready-to-install Android TV release APK (`CleanYourTV-Community-v1.0.0-release.apk`) under dedicated application ID `com.abdulbotz.tvhome`.
 - Resolved Android 11+ (`targetSdk 34`) package visibility filtering via `QUERY_ALL_PACKAGES`.
 - Expanded app discovery to include OEM App Stores, standard Android apps (`CATEGORY_LAUNCHER`), and system settings.
 - Memory & scrolling optimization for 2 GB RAM TVs with Cortex-A53 CPU & Mali-450 GPU.
